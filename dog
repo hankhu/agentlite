@@ -1,0 +1,34 @@
+#!/usr/bin/env python3
+"""AgentLite - single prompt runner"""
+
+import json
+import sys
+import os
+
+sys.path.insert(0, ".")
+
+from agentlite import Agent
+
+
+def load_config(path: str = "") -> dict:
+    if not path:
+        path = os.path.expanduser("~/.config/agentlite/config.json")
+    path = os.path.expanduser(path)
+    if os.path.exists(path):
+        with open(path) as f:
+            data = json.load(f)
+        return data.get("llm", data)
+    return {}
+
+
+llm_config = load_config()
+
+# CLI 参数可覆盖
+if len(sys.argv) > 2:
+    llm_config["model"] = sys.argv[2]
+
+agent = Agent(llm_config=llm_config)
+
+prompt = sys.argv[1] if len(sys.argv) > 1 else "hello"
+result = agent.run(prompt)
+print(f"\n=== Answer ===\n{result}\n=== End ===")

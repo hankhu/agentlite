@@ -1,0 +1,443 @@
+#!/usr/bin/env python3
+"""
+AgentLite 多轮对话客户端
+
+交互式 REPL，agent 上下文跨轮保持。
+支持命令和彩色输出。
+
+用法:
+    ./agentchat                         # 默认配置
+    ./agentchat --model gpt-4o          # 指定模型
+    ./agentchat --verbose               # 显示详细日志
+"""
+
+import sys
+import os
+import readline  # 提供历史/行编辑
+import argparse
+import logging
+from pathlib import Path
+
+# ── 加载 agentlite ──────────────────────────────────────────
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from agentlite import Agent, AgentConfig
+
+
+# ── 颜色 ────────────────────────────────────────────────────
+
+class Color:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+
+    USER = "\033[36m"        # 青色
+    ASSISTANT = "\033[32m"   # 绿色
+    SYSTEM = "\033[33m"      # 黄色
+    TOOL = "\033[35m"        # 紫色
+    ERROR = "\033[31m"       # 红色
+    PROMPT = "\033[34m"      # 蓝色
+    YELLOW = "\033[33m"     # 黄色（同 SYSTEM）
+    GREY = "\033[90m"
+
+
+# ── 命令 ────────────────────────────────────────────────────
+
+COMMANDS = {
+    "/exit": "退出对话",
+    "/quit": "退出对话",
+    "/clear": "清空短期记忆（保留 history 显示）",
+    "/reset": "完全重置 agent（清空所有记忆）",
+    "/tools": "列出当前可用工具",
+    "/help": "显示帮助",
+    "/save <name>": "保存会话到文件",
+    "/load <name>": "从文件恢复会话",
+    "/verbose": "切换 verbose 模式",
+    "/plan": "查看当前 {}",
+}
+
+
+# ── 对话客户端 ─────────────────────────────────────────────
+
+class ChatClient:
+    """多轮对话客户端"""
+
+    def __init__(self, config: AgentConfig, model: str = "",
+                 api_key: str = "", base_url: str = "",
+                 config_path: str = "",
+                 tools=None, verbose: bool = False):
+        # ── 加载配置文件 ────────────────────────────────
+        file_cfg = _load_config_file(config_path)
+
+        # ── 确定最终 LLM 配置（文件 < 环境变量 < CLI 参数）─
+        llm_cfg = {}
+
+        # 1. 文件配置作为基底
+        if file_cfg:
+            llm_cfg.update(file_cfg)
+
+        # 2. 环境变量覆盖
+        if not llm_cfg.get("api_key"):
+            llm_cfg["api_key"] = os.environ.get("LLM_API_KEY", "")
+        if not llm_cfg.get("base_url"):
+            llm_cfg["base_url"] = os.environ.get("LLM_BASE_URL",
+                                                  "https://api.openai.com/v1")
+        if not llm_cfg.get("model"):
+            llm_cfg["model"] = os.environ.get("LLM_MODEL", "gpt-4o")
+
+        # 3. CLI 参数最高优先级
+        if model:
+            llm_cfg["model"] = model
+        if api_key:
+            llm_cfg["api_key"] = api_key
+        if base_url:
+            llm_cfg["base_url"] = base_url
+
+        config.verbose = verbose
+        self.config = config
+
+        # 创建 agent
+        self.agent = Agent(
+            config=config,
+            llm_config=llm_cfg if llm_cfg else None,
+            tools=tools,
+        )
+
+        self.verbose = verbose
+        self.running = True
+        self.history: list[tuple[str, str]] = []
+
+        if self.verbose:
+            self._msg_system(f"配置: {llm_cfg.get('model')} @ {llm_cfg.get('base_url')}")
+
+    # ── 主循环 ─────────────────────────────────────────────
+
+    def run(self):
+        print()
+        self._print_banner()
+        print()
+
+        while self.running:
+            try:
+                user_input = self._prompt()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                self._msg_system("再见！")
+                break
+
+            if not user_input:
+                continue
+
+            # 处理命令
+            if user_input.startswith("/"):
+                self._handle_command(user_input)
+                continue
+
+            # 发送给 agent
+            self._handle_message(user_input)
+
+    # ── 消息处理 ───────────────────────────────────────────
+
+    def _handle_message(self, text: str):
+        """将用户消息发给 agent 并显示结果"""
+        self.history.append(("user", text))
+
+        # 注册钩子：工具调用始终显示，执行结果仅 verbose 模式
+        self.agent.on_before_tool(self._on_tool_before)
+        if self.verbose:
+            self.agent.on_after_tool(self._on_tool_after)
+
+        try:
+            # 使用 chat() 保留历史上下文
+            result = self.agent.chat(text)
+        except Exception as e:
+            self._msg_error(f"Agent 出错: {e}")
+            import traceback
+            traceback.print_exc()
+            return
+
+        # 分离钩子
+        self.agent._before_tool_hooks.clear()
+        if self.verbose:
+            self.agent._after_tool_hooks.clear()
+
+        self.history.append(("assistant", result))
+        self._msg_assistant(result)
+
+        # 显示 token 消耗
+        usage = self.agent.last_usage
+        if usage and usage.total_tokens > 0:
+            self._msg_usage(usage)
+
+    def _on_tool_before(self, tc, agent):
+        """工具调用前显示"""
+        args = tc.arguments
+        # 精简参数显示
+        if "content" in args and len(args["content"]) > 100:
+            args = {**args, "content": args["content"][:100] + "..."}
+        args_str = ", ".join(f"{k}={v}" for k, v in args.items())
+        self._msg_tool(f"  🛠  {tc.name}({args_str})")
+        return None  # 不阻止
+
+    def _on_tool_after(self, tr, agent):
+        """工具调用后显示"""
+        status = "✓" if tr.success else "✗"
+        self._msg_tool(f"  {status} → {tr.summary()[:120]}")
+
+    # ── 命令处理 ───────────────────────────────────────────
+
+    def _handle_command(self, cmd: str):
+        parts = cmd.strip().split(maxsplit=1)
+        command = parts[0].lower()
+        arg = parts[1] if len(parts) > 1 else ""
+
+        if command in ("/exit", "/quit"):
+            self._msg_system("再见！")
+            self.running = False
+
+        elif command == "/clear":
+            self.agent.short_term.clear()
+            self._msg_system("短期记忆已清空。")
+            # 重新添加活跃的 system prompt
+            self.agent.short_term.add_system(
+                self.agent._build_system_prompt())
+            self._msg_system("System prompt 已重建。")
+
+        elif command == "/reset":
+            # 完全重置
+            self.agent.state = "idle"
+            self.agent.short_term.clear()
+            self.agent.short_term.working.clear()
+            self.history.clear()
+            self._msg_system("Agent 已完全重置。")
+
+        elif command == "/tools":
+            tools = self.agent.tool_registry.list_all()
+            self._msg_system(f"可用工具 ({len(tools)}):")
+            for t in tools:
+                dangerous = " ⚠️" if t.dangerous else ""
+                self._msg_system(f"  • {t.name}{dangerous}")
+                # 缩进显示描述
+                desc = t.description.replace("\n", " ")
+                self._msg_system(f"    {desc[:120]}")
+
+        elif command == "/verbose":
+            self.verbose = not self.verbose
+            self.config.verbose = self.verbose
+            self.agent.config.verbose = self.verbose
+            self._msg_system(f"Verbose 模式: {'ON' if self.verbose else 'OFF'}")
+
+        elif command == "/help":
+            self._print_help()
+
+        elif command in ("/save", "/load"):
+            if not arg:
+                self._msg_error(f"用法: {command} <文件名>")
+                return
+            path = f"~/.agentlite/sessions/{arg}.json"
+            expanded = os.path.expanduser(path)
+
+            if command == "/save":
+                self._save_session(expanded)
+            else:
+                self._load_session(expanded)
+
+        elif command == "/plan":
+            plan = self.agent.short_term.get_working("_plan")
+            if plan:
+                self._msg_system(f"当前计划:\n{plan}")
+            else:
+                self._msg_system("暂无活跃计划。")
+
+        else:
+            self._msg_error(f"未知命令: {command}。输入 /help 查看帮助。")
+
+    # ── 保存/加载 ──────────────────────────────────────────
+
+    def _save_session(self, path: str):
+        import json
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        data = {
+            "history": self.history,
+            "working": self.agent.short_term.working,
+        }
+        with open(path, "w") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        self._msg_system(f"会话已保存到 {path}")
+
+    def _load_session(self, path: str):
+        import json
+        if not os.path.exists(path):
+            self._msg_error(f"文件不存在: {path}")
+            return
+        with open(path) as f:
+            data = json.load(f)
+        self.history = data.get("history", [])
+        self.agent.short_term.working.update(data.get("working", {}))
+        # 重建短期记忆
+        self.agent.short_term.clear()
+        self.agent.short_term.add_system(self.agent._build_system_prompt())
+        for role, content in self.history:
+            if role == "user":
+                self.agent.short_term.add_user(content)
+            elif role == "assistant":
+                self.agent.short_term.add_assistant(content)
+        self._msg_system(
+            f"会话已恢复 ({len(self.history)} 条消息)。")
+
+    # ── UI ─────────────────────────────────────────────────
+
+    def _prompt(self) -> str:
+        """显示输入提示并获取输入"""
+        try:
+            text = input(f"{Color.PROMPT}╭─ {Color.BOLD}你{Color.RESET}"
+                         f"{Color.GREY} (输入 /help 查看命令){Color.RESET}\n"
+                         f"{Color.PROMPT}╰─▶{Color.RESET} ")
+            return text.strip()
+        except UnicodeDecodeError:
+            # 某些特殊字符可能导致 readline 出错
+            return ""
+
+    def _msg_assistant(self, text: str):
+        self._print_colored("Agent", text, Color.ASSISTANT)
+
+    def _msg_system(self, text: str):
+        self._print_colored("系统", text, Color.SYSTEM)
+
+    def _msg_error(self, text: str):
+        self._print_colored("错误", text, Color.ERROR)
+
+    def _msg_usage(self, usage):
+        """显示 token 消耗（紧凑一行）"""
+        if usage and hasattr(usage, 'total_tokens') and usage.total_tokens > 0:
+            text = (f"Prompt: {usage.prompt_tokens}  "
+                    f"Completion: {usage.completion_tokens}  "
+                    f"Total: {usage.total_tokens}")
+            self._print_colored("用量 ▲", text, Color.GREY)
+
+    def _msg_tool(self, text: str):
+        self._print_colored("工具", text, Color.TOOL)
+
+    def _print_colored(self, label: str, text: str, color: str):
+        """格式化输出"""
+        lines = text.split("\n")
+        first = f"{color}╭─ {Color.BOLD}{label}{Color.RESET}"
+        print(first)
+        for line in lines:
+            print(f"{color}│{Color.RESET} {line}")
+        # 底部线条
+        print(f"{color}╰─{Color.RESET}")
+
+    def _print_banner(self):
+        """打印启动横幅"""
+        model = self.agent.config.llm.model
+        tools = len(self.agent.tool_registry.list_all())
+        print(f"{Color.BOLD}🤖 AgentLite Chat{Color.RESET}")
+        print(f"{Color.GREY}  Model: {model}")
+        print(f"  Tools: {tools}  |  "
+              f"Type /help for commands{Color.RESET}")
+
+    def _print_help(self):
+        """打印帮助"""
+        self._msg_system("可用命令:")
+        for cmd, desc in COMMANDS.items():
+            self._msg_system(f"  {cmd}")
+            self._msg_system(f"    {desc}")
+
+    # ── 临时覆盖 system prompt ─────────────────────────────
+
+    def set_system_prompt(self, prompt: str):
+        """设置自定义 system prompt"""
+        self.config.system_prompt = prompt
+        self.agent.short_term.add_system(prompt)
+        self._msg_system("System prompt 已更新。")
+
+
+# ── 入口 ────────────────────────────────────────────────────
+
+def _load_config_file(path: str = "") -> dict:
+    """加载配置文件，默认 ~/.config/agentlite/config.json"""
+    import json
+    if not path:
+        path = os.path.expanduser("~/.config/agentlite/config.json")
+    path = os.path.expanduser(path)
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        # 支持直接写 {"model": ..., "api_key": ..., ...}
+        # 也支持 {"llm": {"model": ..., ...}}
+        if "llm" in data:
+            return data["llm"]
+        return data
+    except (json.JSONDecodeError, IOError) as e:
+        print(f"{Color.YELLOW}配置文件读取失败: {e}{Color.RESET}", file=sys.stderr)
+        return {}
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="AgentLite 多轮对话客户端",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+配置文件优先级: CLI 参数 > 环境变量 > ~/.config/agentlite/config.json > 默认值
+
+环境变量:
+  LLM_API_KEY       API 密钥
+  LLM_MODEL         模型名
+  LLM_BASE_URL      API 地址
+
+示例:
+  ./agentchat
+  ./agentchat --config ~/my-config.json
+  ./agentchat --model gpt-4o
+  LLM_BASE_URL=http://localhost:11434/v1 ./agentchat
+        """,
+    )
+    parser.add_argument("--model", default="",
+                        help="LLM 模型名（覆盖配置文件）")
+    parser.add_argument("--api-key", default="",
+                        help="API 密钥（覆盖配置文件）")
+    parser.add_argument("--base-url", default="",
+                        help="API 地址（覆盖配置文件）")
+    parser.add_argument("--config", default="",
+                        help="配置文件路径 (默认 ~/.config/agentlite/config.json)")
+    parser.add_argument("--verbose", action="store_true",
+                        help="显示详细日志和工具调用")
+    parser.add_argument("--debug", action="store_true",
+                        help="显示 DEBUG 级别日志")
+
+    args = parser.parse_args()
+
+    # 日志
+    level = logging.DEBUG if args.debug else (
+        logging.INFO if args.verbose else logging.WARNING)
+    logging.basicConfig(
+        level=level,
+        format="%(levelname)s %(name)s: %(message)s",
+    )
+
+    config = AgentConfig()
+
+    client = ChatClient(
+        config=config,
+        config_path=args.config,
+        model=args.model,
+        api_key=args.api_key,
+        base_url=args.base_url,
+        verbose=args.verbose,
+    )
+
+    try:
+        client.run()
+    except KeyboardInterrupt:
+        print("\n再见！")
+    except Exception as e:
+        print(f"\n{Color.ERROR}致命错误: {e}{Color.RESET}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
