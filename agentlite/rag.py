@@ -215,7 +215,7 @@ class RAGEngine:
     def embed_all(self, progress_callback=None) -> int:
         """对所有未嵌入的 chunk 计算嵌入。返回嵌入数量。"""
         if self.llm is None:
-            raise RuntimeError("Cannot embed without LLM interface")
+            return 0
 
         unembedded = [c for c in self.chunks if c.embedding is None]
         if not unembedded:
@@ -254,8 +254,12 @@ class RAGEngine:
         # 确保有嵌入
         embedded = [c for c in self.chunks if c.embedding is not None]
         if not embedded:
-            self.embed_all()
-            embedded = [c for c in self.chunks if c.embedding is not None]
+            try:
+                self.embed_all()
+                embedded = [c for c in self.chunks if c.embedding is not None]
+            except Exception as e:
+                logger.warning(f"Embed all failed: {e}, using keyword fallback")
+                embedded = []
         if not embedded:
             return self._keyword_search(query, k)
 
@@ -301,9 +305,11 @@ class RAGEngine:
 
     def _keyword_search(self, query: str,
                         k: Optional[int] = None) -> List[SearchResult]:
-        """退化的关键词搜索（BM25 的极简替代）"""
+        """关键词搜索（支持中日韩文，无空格语言的词边界检测）"""
         k = k or self.config.top_k
-        query_terms = query.lower().split()
+
+        # 对无空格语言（中文、日文等）做 char n-gram + 原词混合
+        query_terms = self._tokenize(query)
 
         scored = []
         for chunk in self.chunks:
@@ -312,11 +318,35 @@ class RAGEngine:
             score = sum(text_lower.count(t) for t in query_terms)
             if score > 0:
                 # 归一化
-                score = score / (len(chunk.text.split()) + 1)
+                score = score / (len(chunk.text) + 1)
                 scored.append(SearchResult(chunk=chunk, score=score))
 
         scored.sort(key=lambda x: x.score, reverse=True)
         return scored[:k]
+
+    @staticmethod
+    def _tokenize(text: str) -> list:
+        """分词：英文按空格，中日韩文拆成单字 + 2-gram"""
+        text = text.lower()
+        tokens = set()
+
+        # 英文/数字 token（空格分隔）
+        import re
+        words = re.findall(r"[a-z0-9]+", text)
+        tokens.update(words)
+
+        # 中日韩文：拆成单字 + 2-gram
+        cjk = re.findall(r"[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff"
+                         r"\uac00-\ud7af]+", text)
+        for chunk in cjk:
+            # 单字
+            for ch in chunk:
+                tokens.add(ch)
+            # 2-gram
+            for i in range(len(chunk) - 1):
+                tokens.add(chunk[i:i+2])
+
+        return list(tokens)
 
     # ── Management ────────────────────────────────────────
 
